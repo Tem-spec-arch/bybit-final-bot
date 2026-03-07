@@ -13,8 +13,8 @@ import ta
 # ==============================
 # CONFIG
 # ==============================
-API_KEY = os.getenv("BYBIT_KEY")
-API_SECRET = os.getenv("BYBIT_SECRET")
+API_KEY = os.getenv("BYBIT_API_KEY")
+API_SECRET = os.getenv("BYBIT_API_SECRET")
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT"]
 ENTRY_TF = "5m"
