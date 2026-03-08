@@ -1,27 +1,35 @@
-name: Run Bybit Bot
+name: Run Bybit Trading Bot
 
+# Schedule: Runs during 08:00-11:00 and 14:00-16:00 WAT (UTC+1)
 on:
   schedule:
-    - cron: "*/5 * * * *"
-  workflow_dispatch:
+    # 08:00-11:00 WAT → 07:00-10:55 UTC, every 5 minutes
+    - cron: "*/5 7-10 * * *"
+    # 14:00-16:00 WAT → 13:00-15:55 UTC, every 5 minutes
+    - cron: "*/5 13-15 * * *"
+  workflow_dispatch: # allows manual trigger
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
 
     steps:
+      # 1. Check out the repository
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Install Python
+      # 2. Set up Python 3.10
+      - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: "3.10"
 
+      # 3. Install Python dependencies from requirements.txt
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install --upgrade pip && pip install -r requirements.txt
 
-      - name: Run trading bot
+      # 4. Run the bot
+      - name: Run Bybit Bot
         env:
           BYBIT_API_KEY: ${{ secrets.BYBIT_API_KEY }}
           BYBIT_API_SECRET: ${{ secrets.BYBIT_API_SECRET }}
