@@ -32,8 +32,9 @@ MAX_TRADES_PER_SESSION = 2  # max per pair per session
 # ==============================
 # EXCHANGE CONNECTION
 # ==============================
+# Updated for current pybit V5 standards
 session = HTTP(
-    endpoint="https://api.bybit.com",
+    testnet=False,
     api_key=API_KEY,
     api_secret=API_SECRET
 )
@@ -41,9 +42,9 @@ session = HTTP(
 # Set leverage for each pair
 for s in SYMBOLS:
     try:
-        session.set_leverage(symbol=s, buy_leverage=LEVERAGE, sell_leverage=LEVERAGE)
-    except Exception as e:
-        print(f"Leverage already set or error: {e}")
+        session.set_leverage(category="linear", symbol=s, buyLeverage=str(LEVERAGE), sellLeverage=str(LEVERAGE))
+    except:
+        pass # Already set
 
 # ==============================
 # LOGGING
@@ -58,39 +59,25 @@ logging.basicConfig(filename="pybit_bot.log",
 active_trades = {}
 day_start_balance = None
 current_day = None
-trades_today = {}  # track trades per session per pair
+trades_today = {}
 
 # ==============================
 # SESSION FILTERING (WAT)
 # ==============================
 def trading_session_wat():
-    # Nigerian Time is UTC+1
     h = (dt.datetime.utcnow() + dt.timedelta(hours=1)).hour
-
-    # London session: 08:00 - 11:00 WAT
-    # NY session: 14:00 - 16:00 WAT
     return (8 <= h < 11) or (14 <= h < 16)
-
-def current_session_wat():
-    h = (dt.datetime.utcnow() + dt.timedelta(hours=1)).hour
-    if 8 <= h < 11:
-        return "London"
-    elif 14 <= h < 16:
-        return "NY"
-    else:
-        return None
 
 # ==============================
 # DATA FETCHING
 # ==============================
 def get_ohlcv(symbol, interval, limit=200):
-    data = session.get_kline(symbol=symbol, interval=interval, limit=limit)
+    data = session.get_kline(category="linear", symbol=symbol, interval=interval, limit=limit)
     df = pd.DataFrame(data['result']['list'])
-    df.columns = ['start', 'open', 'high', 'low', 'close', 'volume', 'turnover']
-    df['time'] = pd.to_datetime(df['start'].astype(float)*1000000)
-    df.rename(columns={'open': 'Open', 'high':'High', 'low':'Low', 'close':'Close', 'volume':'Volume'}, inplace=True)
+    df.columns = ['start', 'Open', 'High', 'Low', 'Close', 'Volume', 'Turnover']
     df[['Open','High','Low','Close','Volume']] = df[['Open','High','Low','Close','Volume']].astype(float)
-    # Bybit returns newest first, we need oldest first for indicators
+    df['time'] = pd.to_datetime(df['start'].astype(float)*1000000)
+    # Sort from oldest to newest for indicators
     df = df.iloc[::-1].reset_index(drop=True)
     return df
 
@@ -125,7 +112,6 @@ def detect_fvg(df, direction):
     return False
 
 def asia_range(df):
-    # This filters the dataframe for hours before 6 AM
     asia = df[df['time'].dt.hour < 6]
     if asia.empty:
         return df['High'].max(), df['Low'].min()
@@ -144,9 +130,9 @@ def risk_pct(acc):
 def calc_position_size(acc, entry, stop):
     risk_amount = acc * risk_pct(acc)
     stop_distance = abs(entry - stop)
-    if stop_distance == 0: return 0, 0
+    if stop_distance == 0: return 0
     size = risk_amount / stop_distance
-    return size, risk_amount
+    return size
 
 def liquidation_safe(entry, stop):
     return abs(entry - stop) > entry * 0.002
@@ -172,34 +158,20 @@ def dd_ok(acc):
 # ==============================
 def place_trade(symbol, direction, entry, stop, target, size):
     side = "Buy" if direction=="buy" else "Sell"
-    opp_side = "Sell" if direction=="buy" else "Buy"
 
-    # Market entry
+    # Market entry with TP/SL attached (V5 Method)
     session.place_order(
         category="linear",
         symbol=symbol,
         side=side,
         orderType="Market",
         qty=str(round(size, 3)),
-        timeInForce="GTC"
-    )
-
-    # Stop loss
-    session.set_trading_stop(
-        category="linear",
-        symbol=symbol,
-        stopLoss=str(round(stop, 2)),
-        slTriggerBy="LastPrice",
-        tpslMode="Full"
-    )
-
-    # Take profit
-    session.set_trading_stop(
-        category="linear",
-        symbol=symbol,
         takeProfit=str(round(target, 2)),
+        stopLoss=str(round(stop, 2)),
         tpTriggerBy="LastPrice",
-        tpslMode="Full"
+        slTriggerBy="LastPrice",
+        tpslMode="Full",
+        timeInForce="GTC"
     )
 
     active_trades[symbol] = {
@@ -211,26 +183,29 @@ def place_trade(symbol, direction, entry, stop, target, size):
         "be": False
     }
     trades_today[symbol] = trades_today.get(symbol, 0) + 1
-    logging.info(f"{symbol} {direction} trade placed | size: {size} | entry: {entry} | stop: {stop}")
+    logging.info(f"{symbol} {direction} trade placed | entry: {entry}")
 
 # ==============================
 # TRADE MANAGEMENT
 # ==============================
 def manage_trade(symbol, price):
     trade = active_trades.get(symbol)
-    if not trade:
+    if not trade or trade['be']:
         return
     entry = trade['entry']
     stop = trade['stop']
     direction = trade['direction']
     r = abs(entry - stop)
-    if not trade['be']:
-        if direction == "buy" and price >= entry + r * BE_R:
-            session.set_trading_stop(category="linear", symbol=symbol, stopLoss=str(entry))
-            trade['be'] = True
-        if direction == "sell" and price <= entry - r * BE_R:
-            session.set_trading_stop(category="linear", symbol=symbol, stopLoss=str(entry))
-            trade['be'] = True
+    
+    # Move to Break Even
+    if (direction == "buy" and price >= entry + r * BE_R) or (direction == "sell" and price <= entry - r * BE_R):
+        session.set_trading_stop(
+            category="linear",
+            symbol=symbol,
+            stopLoss=str(entry),
+            slTriggerBy="LastPrice"
+        )
+        trade['be'] = True
 
 # ==============================
 # MAIN LOOP
@@ -238,24 +213,20 @@ def manage_trade(symbol, price):
 def run():
     try:
         acc = get_balance()
-    except:
-        return
-        
-    daily_reset(acc)
-    if not dd_ok(acc):
+    except Exception as e:
+        logging.error(f"Balance error: {e}")
         return
 
-    if not trading_session_wat():
+    daily_reset(acc)
+    if not dd_ok(acc) or not trading_session_wat():
         return
 
     for symbol in SYMBOLS:
         if trades_today.get(symbol, 0) >= MAX_TRADES_PER_SESSION:
             continue
 
-        df5 = get_ohlcv(symbol, ENTRY_TF)
-        df1h = get_ohlcv(symbol, BIAS_TF)
-        df1h = add_indicators(df1h)
-        df5 = add_indicators(df5)
+        df5 = add_indicators(get_ohlcv(symbol, ENTRY_TF))
+        df1h = add_indicators(get_ohlcv(symbol, BIAS_TF))
 
         bias = "buy" if df1h['Close'].iloc[-1] > df1h['EMA50'].iloc[-1] else "sell"
         high, low = asia_range(df5)
@@ -274,33 +245,28 @@ def run():
         if not direction:
             continue
 
-        if not volume_spike(df5):
-            continue
-        if not detect_mss(df5, direction):
-            continue
-        if not detect_fvg(df5, direction):
+        if not volume_spike(df5) or not detect_mss(df5, direction) or not detect_fvg(df5, direction):
             continue
 
         stop = df5['Low'].iloc[-6] if direction=="buy" else df5['High'].iloc[-6]
         
-        # FIXED LINE 277
+        # FIXED SYNTAX HERE
         target = price + (price-stop)*RR if direction=="buy" else price - (stop-price)*RR
 
         if not liquidation_safe(price, stop):
             continue
 
-        size, _ = calc_position_size(acc, price, stop)
-        if size <= 0: continue
-
-        place_trade(symbol, direction, price, stop, target, size)
+        size = calc_position_size(acc, price, stop)
+        if size > 0:
+            place_trade(symbol, direction, price, stop, target, size)
 
 # ==============================
-# LOOP
+# EXECUTION
 # ==============================
 if __name__ == "__main__":
     while True:
         try:
             run()
         except Exception as e:
-            logging.error(f"Main Loop Error: {str(e)}")
-        time.sleep(60) 
+            logging.error(f"Loop Error: {str(e)}")
+        time.sleep(60)
