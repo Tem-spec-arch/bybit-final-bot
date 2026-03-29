@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
 # This pulls the proxy from your GitHub Secrets
-PROXY_URL = os.getenv("BYBIT_PROXY") 
+PROXY_URL = os.getenv("http://31.58.9.4") 
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT"]
 RISK_USD = 10.0          
