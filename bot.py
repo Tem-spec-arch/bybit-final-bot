@@ -40,7 +40,10 @@ session = HTTP(
 
 # Set leverage for each pair
 for s in SYMBOLS:
-    session.set_leverage(symbol=s, buy_leverage=LEVERAGE, sell_leverage=LEVERAGE)
+    try:
+        session.set_leverage(symbol=s, buy_leverage=LEVERAGE, sell_leverage=LEVERAGE)
+    except Exception as e:
+        print(f"Leverage already set or error: {e}")
 
 # ==============================
 # LOGGING
@@ -82,10 +85,13 @@ def current_session_wat():
 # ==============================
 def get_ohlcv(symbol, interval, limit=200):
     data = session.get_kline(symbol=symbol, interval=interval, limit=limit)
-    df = pd.DataFrame(data['result'])
-    df['time'] = pd.to_datetime(df['start']*1000000)
+    df = pd.DataFrame(data['result']['list'])
+    df.columns = ['start', 'open', 'high', 'low', 'close', 'volume', 'turnover']
+    df['time'] = pd.to_datetime(df['start'].astype(float)*1000000)
     df.rename(columns={'open': 'Open', 'high':'High', 'low':'Low', 'close':'Close', 'volume':'Volume'}, inplace=True)
     df[['Open','High','Low','Close','Volume']] = df[['Open','High','Low','Close','Volume']].astype(float)
+    # Bybit returns newest first, we need oldest first for indicators
+    df = df.iloc[::-1].reset_index(drop=True)
     return df
 
 # ==============================
@@ -119,15 +125,18 @@ def detect_fvg(df, direction):
     return False
 
 def asia_range(df):
+    # This filters the dataframe for hours before 6 AM
     asia = df[df['time'].dt.hour < 6]
+    if asia.empty:
+        return df['High'].max(), df['Low'].min()
     return asia['High'].max(), asia['Low'].min()
 
 # ==============================
 # ACCOUNT & RISK
 # ==============================
 def get_balance():
-    bal = session.get_wallet_balance()
-    return float(bal['result']['USDT']['wallet_balance'])
+    bal = session.get_wallet_balance(accountType="UNIFIED")
+    return float(bal['result']['list'][0]['coin'][0]['walletBalance'])
 
 def risk_pct(acc):
     return RISK_REDUCED if acc >= RISK_SWITCH_BALANCE else RISK_INITIAL
@@ -135,6 +144,7 @@ def risk_pct(acc):
 def calc_position_size(acc, entry, stop):
     risk_amount = acc * risk_pct(acc)
     stop_distance = abs(entry - stop)
+    if stop_distance == 0: return 0, 0
     size = risk_amount / stop_distance
     return size, risk_amount
 
@@ -162,37 +172,34 @@ def dd_ok(acc):
 # ==============================
 def place_trade(symbol, direction, entry, stop, target, size):
     side = "Buy" if direction=="buy" else "Sell"
+    opp_side = "Sell" if direction=="buy" else "Buy"
 
     # Market entry
-    session.place_active_order(
+    session.place_order(
+        category="linear",
         symbol=symbol,
         side=side,
-        order_type="Market",
-        qty=size,
-        time_in_force="GoodTillCancel",
-        reduce_only=False
+        orderType="Market",
+        qty=str(round(size, 3)),
+        timeInForce="GTC"
     )
 
     # Stop loss
-    session.place_conditional_order(
+    session.set_trading_stop(
+        category="linear",
         symbol=symbol,
-        side="Sell" if direction=="buy" else "Buy",
-        order_type="Market",
-        qty=size,
-        stop_price=stop,
-        time_in_force="GoodTillCancel",
-        reduce_only=True
+        stopLoss=str(round(stop, 2)),
+        slTriggerBy="LastPrice",
+        tpslMode="Full"
     )
 
     # Take profit
-    session.place_conditional_order(
+    session.set_trading_stop(
+        category="linear",
         symbol=symbol,
-        side="Sell" if direction=="buy" else "Buy",
-        order_type="Market",
-        qty=size,
-        stop_price=target,
-        time_in_force="GoodTillCancel",
-        reduce_only=True
+        takeProfit=str(round(target, 2)),
+        tpTriggerBy="LastPrice",
+        tpslMode="Full"
     )
 
     active_trades[symbol] = {
@@ -203,8 +210,8 @@ def place_trade(symbol, direction, entry, stop, target, size):
         "size": size,
         "be": False
     }
-    trades_today[symbol] += 1
-    logging.info(f"{symbol} {direction} trade placed | size: {size:.4f} | entry: {entry} | stop: {stop} | target: {target}")
+    trades_today[symbol] = trades_today.get(symbol, 0) + 1
+    logging.info(f"{symbol} {direction} trade placed | size: {size} | entry: {entry} | stop: {stop}")
 
 # ==============================
 # TRADE MANAGEMENT
@@ -219,17 +226,21 @@ def manage_trade(symbol, price):
     r = abs(entry - stop)
     if not trade['be']:
         if direction == "buy" and price >= entry + r * BE_R:
-            trade['stop'] = entry
+            session.set_trading_stop(category="linear", symbol=symbol, stopLoss=str(entry))
             trade['be'] = True
         if direction == "sell" and price <= entry - r * BE_R:
-            trade['stop'] = entry
+            session.set_trading_stop(category="linear", symbol=symbol, stopLoss=str(entry))
             trade['be'] = True
 
 # ==============================
 # MAIN LOOP
 # ==============================
 def run():
-    acc = get_balance()
+    try:
+        acc = get_balance()
+    except:
+        return
+        
     daily_reset(acc)
     if not dd_ok(acc):
         return
@@ -238,7 +249,6 @@ def run():
         return
 
     for symbol in SYMBOLS:
-        # Enforce max trades per session
         if trades_today.get(symbol, 0) >= MAX_TRADES_PER_SESSION:
             continue
 
@@ -251,21 +261,19 @@ def run():
         high, low = asia_range(df5)
         price = df5['Close'].iloc[-1]
 
-        # Manage existing trades
         if symbol in active_trades:
             manage_trade(symbol, price)
             continue
 
-        # Determine entry
         direction = None
         if bias == "buy" and price < low:
             direction = "buy"
         elif bias == "sell" and price > high:
             direction = "sell"
+        
         if not direction:
             continue
 
-        # Confirm conditions
         if not volume_spike(df5):
             continue
         if not detect_mss(df5, direction):
@@ -274,17 +282,16 @@ def run():
             continue
 
         stop = df5['Low'].iloc[-6] if direction=="buy" else df5['High'].iloc[-6]
-        target = price + (price-stop)*RR if direction=="buy
-target = price + (price-stop)*RR if direction=="buy" else price - (stop-price)*RR
+        
+        # FIXED LINE 277
+        target = price + (price-stop)*RR if direction=="buy" else price - (stop-price)*RR
 
-        # Safety check
         if not liquidation_safe(price, stop):
             continue
 
-        # Calculate position size
         size, _ = calc_position_size(acc, price, stop)
+        if size <= 0: continue
 
-        # Place trade
         place_trade(symbol, direction, price, stop, target, size)
 
 # ==============================
@@ -295,5 +302,5 @@ if __name__ == "__main__":
         try:
             run()
         except Exception as e:
-            logging.error(str(e))
-        time.sleep(60)  # run every minute
+            logging.error(f"Main Loop Error: {str(e)}")
+        time.sleep(60)
