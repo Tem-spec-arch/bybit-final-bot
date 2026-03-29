@@ -12,9 +12,9 @@ PROXY_URL = os.getenv("http://31.58.9.4")
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT"]
 RISK_USD = 10.0          
-KILL_SWITCH = 60.0       
+KILL_SWITCH = 40.0       
 RR_RATIO = 4             
-MAX_DAILY_TRADES = 4     
+MAX_DAILY_TRADES = 8     
 
 # Create Session with Proxy to bypass the 403 Forbidden Error
 session = HTTP(
