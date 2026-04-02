@@ -1,97 +1,175 @@
 import os
 import pandas as pd
 import ta
-from pybit.unified_trading import HTTP
 from datetime import datetime, timedelta
+from pybit.unified_trading import HTTP
 
-# --- 1. SETTINGS & PROXY ---
-API_KEY = os.getenv("BYBIT_API_KEY")
-API_SECRET = os.getenv("BYBIT_API_SECRET")
-# This pulls the proxy from your GitHub Secrets
-PROXY_URL = os.getenv("http://31.58.9.4") 
+PAIRS = ["BTCUSDT", "ETHUSDT"]
+RISK = 0.05
+MAX_DD = 0.40
+MAX_TRADES = 2
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT"]
-RISK_USD = 10.0          
-KILL_SWITCH = 40.0       
-RR_RATIO = 4             
-MAX_DAILY_TRADES = 8     
-
-# Create Session with Proxy to bypass the 403 Forbidden Error
 session = HTTP(
-    testnet=False, 
-    api_key=API_KEY, 
-    api_secret=API_SECRET,
-    proxy=PROXY_URL
+    testnet=False,
+    api_key="YOUR_API_KEY",
+    api_secret="YOUR_SECRET"
 )
 
-def get_trade_count():
-    start_time = int((datetime.now() - timedelta(days=1)).timestamp() * 1000)
-    try:
-        res = session.get_executions(category="linear", startTime=start_time)
-        return len(set([t['orderId'] for t in res['result']['list']]))
-    except: return 0
+start_balance = None
+trades_today = 0
 
-def run_trading_logic():
-    print(f"--- ICT Bot Scan (Proxy Active): {datetime.now().strftime('%H:%M')} ---")
-    
+# ================= TIME FILTER =================
+def in_session():
+    now = datetime.utcnow() + timedelta(hours=1)
+    h, m = now.hour, now.minute
+
+    london = ((h == 7 and m >= 30) or (8 <= h < 10) or (h == 10 and m == 0))
+    newyork = ((h == 13 and m >= 30) or (14 <= h < 15) or (h == 15 and m <= 30))
+
+    return london or newyork
+
+# ================= HELPERS =================
+def get_balance():
+    return float(session.get_wallet_balance(accountType="UNIFIED")["result"]["list"][0]["totalEquity"])
+
+def get_data(symbol, interval):
+    df = pd.DataFrame(session.get_kline(category="linear", symbol=symbol, interval=interval, limit=200)["result"]["list"])
+    df.columns = ["time","open","high","low","close","volume","turnover"]
+    return df.astype(float)
+
+def get_qty_precision(symbol):
     try:
-        # Check Balance & Safety
-        bal_data = session.get_wallet_balance(accountType="UNIFIED")
-        curr_bal = float(bal_data['result']['list'][0]['coin'][0]['walletBalance'])
-        print(f"Current Balance: ${curr_bal}")
-        
-        if curr_bal <= KILL_SWITCH:
-            print("DRAWDOWN LIMIT REACHED. Stopping.")
-            return
+        info = session.get_instruments_info(category="linear", symbol=symbol)
+        step = float(info["result"]["list"][0]["lotSizeFilter"]["qtyStep"])
+        return len(str(step).split(".")[1]) if "." in str(step) else 0
+    except:
+        return 3  # fallback
+
+# ================= STRATEGY =================
+def ema_bias(df):
+    df["ema50"] = ta.trend.ema_indicator(df["close"], 50)
+    return "buy" if df["close"].iloc[-1] > df["ema50"].iloc[-1] else "sell"
+
+def asia(df):
+    r = df.tail(72)
+    return r["high"].max(), r["low"].min()
+
+def sweep(df, high, low):
+    last = df.iloc[-1]
+    if last["high"] > high: return "sell"
+    if last["low"] < low: return "buy"
+    return None
+
+def swings(df):
+    highs, lows = [], []
+    for i in range(2, len(df)-2):
+        if df["high"][i] > df["high"][i-1] and df["high"][i] > df["high"][i+1]:
+            highs.append(df["high"][i])
+        if df["low"][i] < df["low"][i-1] and df["low"][i] < df["low"][i+1]:
+            lows.append(df["low"][i])
+    return highs, lows
+
+def mss(df, d):
+    highs, lows = swings(df)
+    if d == "buy" and highs:
+        return df["close"].iloc[-1] > highs[-1]
+    if d == "sell" and lows:
+        return df["close"].iloc[-1] < lows[-1]
+    return False
+
+def fvg(df, d):
+    for i in range(len(df)-3, 0, -1):
+        c1, c3 = df.iloc[i], df.iloc[i+2]
+        if d == "buy" and c1["high"] < c3["low"]:
+            return (c1["high"], c3["low"])
+        if d == "sell" and c1["low"] > c3["high"]:
+            return (c3["high"], c1["low"])
+    return None
+
+def in_fvg(price, zone):
+    if not zone: return False
+    return zone[0] <= price <= zone[1]
+
+# ================= POSITION =================
+def position_size(balance, entry, sl):
+    dist = abs(entry - sl)
+    if dist == 0:
+        return None
+    return (balance * RISK) / dist
+
+# ================= EXECUTION =================
+def place(symbol, side, qty, sl, tp):
+    precision = get_qty_precision(symbol)
+    qty = round(qty, precision)
+
+    try:
+        session.place_order(
+            category="linear",
+            symbol=symbol,
+            side=side,
+            orderType="Market",
+            qty=qty,
+            stopLoss=round(sl, 2),
+            takeProfit=round(tp, 2)
+        )
     except Exception as e:
-        print(f"Connection failed: {e}")
+        print(f"Order failed: {e}")
+
+# ================= MAIN =================
+def run():
+    global trades_today, start_balance
+
+    if not in_session():
         return
 
-    for symbol in SYMBOLS:
-        # Fetch Data (5m and 1h)
-        k5 = session.get_kline(category="linear", symbol=symbol, interval="5", limit=100)
-        k1h = session.get_kline(category="linear", symbol=symbol, interval="60", limit=50)
-        
-        df = pd.DataFrame(k5['result']['list'], columns=['Time','Open','High','Low','Close','Vol','Turn']).astype(float).iloc[::-1].reset_index(drop=True)
-        df1h = pd.DataFrame(k1h['result']['list'], columns=['Time','Open','High','Low','Close','Vol','Turn']).astype(float).iloc[::-1].reset_index(drop=True)
+    bal = get_balance()
 
-        # 1. NEWS FILTER (Skip if candle > 1.5%)
-        candle_pct = abs(df['Close'].iloc[-1] - df['Open'].iloc[-1]) / df['Open'].iloc[-1]
-        if candle_pct > 0.015: continue 
+    if start_balance is None:
+        start_balance = bal
 
-        # 2. ICT COMPONENTS (EMA + Asia Range)
-        ema50_1h = ta.trend.EMAIndicator(df1h['Close'], 50).ema_indicator().iloc[-1]
-        asia_high, asia_low = df.iloc[:72]['High'].max(), df.iloc[:72]['Low'].min()
-        
-        curr_p = df['Close'].iloc[-1]
-        vol_spike = df['Vol'].iloc[-1] > (df['Vol'].rolling(20).mean().iloc[-1] * 1.8)
+    if bal <= start_balance * (1 - MAX_DD):
+        return
 
-        # 3. MSS & FVG LOGIC
-        fvg_up = df['Low'].iloc[-1] > df['High'].iloc[-3]
-        fvg_down = df['High'].iloc[-1] < df['Low'].iloc[-3]
-        mss_buy = curr_p > df['High'].iloc[-2]
-        mss_sell = curr_p < df['Low'].iloc[-2]
+    if trades_today >= MAX_TRADES:
+        return
 
-        # BUY: Discount Sweep + Trend + MSS + FVG
-        if curr_p > ema50_1h and curr_p < asia_low and vol_spike and mss_buy and fvg_up:
-            execute_order(symbol, "Buy", curr_p, df['Low'].iloc[-2])
+    for pair in PAIRS:
+        df5 = get_data(pair, "5")
+        df1h = get_data(pair, "60")
 
-        # SELL: Premium Sweep + Trend + MSS + FVG
-        elif curr_p < ema50_1h and curr_p > asia_high and vol_spike and mss_sell and fvg_down:
-            execute_order(symbol, "Sell", curr_p, df['High'].iloc[-2])
+        bias = ema_bias(df1h)
+        high, low = asia(df5)
+        sw = sweep(df5, high, low)
 
-def execute_order(symbol, side, price, stop):
-    dist = abs(price - stop)
-    if dist > 0:
-        qty = round(RISK_USD / dist, 3 if "BTC" in symbol else 2)
-        tp = round(price + (dist * RR_RATIO), 2) if side == "Buy" else round(price - (dist * RR_RATIO), 2)
-        sl = round(stop, 2)
-        try:
-            session.place_order(category="linear", symbol=symbol, side=side, orderType="Market", 
-                               qty=str(qty), takeProfit=str(tp), stopLoss=str(sl), tpslMode="Full")
-            print(f"!!! {side.upper()} {symbol} SUCCESS !!!")
-        except Exception as e:
-            print(f"Order Error: {e}")
+        if sw != bias:
+            continue
+
+        if not mss(df5, sw):
+            continue
+
+        zone = fvg(df5, sw)
+        if not zone:
+            continue
+
+        price = df5["close"].iloc[-1]
+        if not in_fvg(price, zone):
+            continue
+
+        entry = price
+        sl = high * 1.001 if sw == "sell" else low * 0.999
+
+        risk_dist = abs(entry - sl)
+
+        # ===== RR FIXED TO 1:2 =====
+        tp = entry - (risk_dist * 2) if sw == "sell" else entry + (risk_dist * 2)
+
+        qty = position_size(bal, entry, sl)
+        if not qty:
+            continue
+
+        place(pair, "Sell" if sw == "sell" else "Buy", qty, sl, tp)
+
+        trades_today += 1
 
 if __name__ == "__main__":
-    run_trading_logic()
+    run()
